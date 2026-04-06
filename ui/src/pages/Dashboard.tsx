@@ -7,10 +7,24 @@ import { issuesApi } from "../api/issues";
 import { agentsApi } from "../api/agents";
 import { projectsApi } from "../api/projects";
 import { heartbeatsApi } from "../api/heartbeats";
+import { approvalsApi } from "../api/approvals";
 import { useCompany } from "../context/CompanyContext";
 import { useDialog } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import {
+  BUDGET_RISK_THRESHOLD_PERCENT,
+  STUCK_RUN_THRESHOLD_MINUTES,
+  TASK_COMPLETION_WINDOW_DAYS,
+  budgetAtRiskAgentCount,
+  countCompletedWithinWindow,
+  countStuckRuns,
+  formatDurationFromMs,
+  getRecentlyCompletedIssues,
+  meanCompletionMs,
+  oldestApprovalAgeMs,
+  parseDate,
+} from "../lib/dashboard-metrics";
 import { MetricCard } from "../components/MetricCard";
 import { EmptyState } from "../components/EmptyState";
 import { StatusIcon } from "../components/StatusIcon";
@@ -19,7 +33,7 @@ import { ActivityRow } from "../components/ActivityRow";
 import { Identity } from "../components/Identity";
 import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
-import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
+import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle, Timer, AlertTriangle, Gauge, CheckCircle2 } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -77,6 +91,12 @@ export function Dashboard() {
   const { data: runs } = useQuery({
     queryKey: queryKeys.heartbeats(selectedCompanyId!),
     queryFn: () => heartbeatsApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+
+  const { data: pendingApprovals } = useQuery({
+    queryKey: [...queryKeys.approvals.list(selectedCompanyId!), "pending"],
+    queryFn: () => approvalsApi.list(selectedCompanyId!, "pending"),
     enabled: !!selectedCompanyId,
   });
 
@@ -184,6 +204,12 @@ export function Dashboard() {
   }
 
   const hasNoAgents = agents !== undefined && agents.length === 0;
+  const stuckRunsCount = countStuckRuns(runs ?? [], STUCK_RUN_THRESHOLD_MINUTES);
+  const meanTaskCompletion = meanCompletionMs(issues ?? [], TASK_COMPLETION_WINDOW_DAYS);
+  const budgetRiskAgents = budgetAtRiskAgentCount(agents ?? [], BUDGET_RISK_THRESHOLD_PERCENT);
+  const approvalQueueAgeMs = oldestApprovalAgeMs(pendingApprovals ?? []);
+  const recentlyCompleted = getRecentlyCompletedIssues(issues ?? []);
+  const completedLast7Days = countCompletedWithinWindow(recentlyCompleted);
 
   return (
     <div className="space-y-6">
@@ -283,6 +309,58 @@ export function Dashboard() {
             />
           </div>
 
+          <div className="space-y-2">
+            <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+              Operational SLOs
+            </h3>
+            <div className="grid grid-cols-2 xl:grid-cols-4 gap-1 sm:gap-2">
+              <MetricCard
+                icon={AlertTriangle}
+                value={stuckRunsCount}
+                label="Stuck Runs"
+                to="/inbox"
+                description={
+                  <span>
+                    Running longer than {STUCK_RUN_THRESHOLD_MINUTES} minutes
+                  </span>
+                }
+              />
+              <MetricCard
+                icon={Timer}
+                value={meanTaskCompletion ? formatDurationFromMs(meanTaskCompletion) : "—"}
+                label="Mean Task Completion"
+                to="/issues"
+                description={
+                  <span>
+                    Average from start to done over last {TASK_COMPLETION_WINDOW_DAYS} days
+                  </span>
+                }
+              />
+              <MetricCard
+                icon={Gauge}
+                value={budgetRiskAgents}
+                label="Budget-At-Risk Agents"
+                to="/agents"
+                description={
+                  <span>
+                    At or above {BUDGET_RISK_THRESHOLD_PERCENT}% of monthly budget
+                  </span>
+                }
+              />
+              <MetricCard
+                icon={ShieldCheck}
+                value={approvalQueueAgeMs ? formatDurationFromMs(approvalQueueAgeMs) : "—"}
+                label="Oldest Approval Age"
+                to="/approvals"
+                description={
+                  <span>
+                    Longest pending board approval wait time
+                  </span>
+                }
+              />
+            </div>
+          </div>
+
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <ChartCard title="Run Activity" subtitle="Last 14 days">
               <RunActivityChart runs={runs ?? []} />
@@ -377,6 +455,55 @@ export function Dashboard() {
                   ))}
                 </div>
               )}
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+              Outcomes
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <MetricCard
+                icon={CheckCircle2}
+                value={completedLast7Days}
+                label="Completed Tasks (7d)"
+                to="/issues"
+                description={<span>Shipped outcomes in the last week</span>}
+              />
+              <div className="rounded-lg border border-border p-4">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-2">
+                  Recently completed
+                </p>
+                {recentlyCompleted.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No completed tasks yet.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {recentlyCompleted.slice(0, 5).map((issue) => {
+                      const startedAt = parseDate(issue.startedAt);
+                      const completedAt = parseDate(issue.completedAt);
+                      const durationMs =
+                        startedAt && completedAt ? Math.max(0, completedAt.getTime() - startedAt.getTime()) : null;
+                      return (
+                        <Link
+                          key={issue.id}
+                          to={`/issues/${issue.identifier ?? issue.id}`}
+                          className="block text-sm no-underline text-inherit hover:bg-accent/40 rounded-md px-2 py-1.5 transition-colors"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate">{issue.title}</span>
+                            <span className="text-xs text-muted-foreground whitespace-nowrap">
+                              {completedAt ? timeAgo(completedAt.toISOString()) : "—"}
+                            </span>
+                          </div>
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            {durationMs ? `Cycle time ${formatDurationFromMs(durationMs)}` : "No start timestamp"}
+                          </p>
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 
