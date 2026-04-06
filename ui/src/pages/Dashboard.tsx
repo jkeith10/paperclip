@@ -12,6 +12,19 @@ import { useCompany } from "../context/CompanyContext";
 import { useDialog } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import {
+  BUDGET_RISK_THRESHOLD_PERCENT,
+  STUCK_RUN_THRESHOLD_MINUTES,
+  TASK_COMPLETION_WINDOW_DAYS,
+  budgetAtRiskAgentCount,
+  countCompletedWithinWindow,
+  countStuckRuns,
+  formatDurationFromMs,
+  getRecentlyCompletedIssues,
+  meanCompletionMs,
+  oldestApprovalAgeMs,
+  parseDate,
+} from "../lib/dashboard-metrics";
 import { MetricCard } from "../components/MetricCard";
 import { EmptyState } from "../components/EmptyState";
 import { StatusIcon } from "../components/StatusIcon";
@@ -26,74 +39,6 @@ import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRa
 import { PageSkeleton } from "../components/PageSkeleton";
 import type { Agent, Issue } from "@paperclipai/shared";
 import { PluginSlotOutlet } from "@/plugins/slots";
-import type { Approval, HeartbeatRun } from "@paperclipai/shared";
-
-const STUCK_RUN_THRESHOLD_MINUTES = 30;
-const BUDGET_RISK_THRESHOLD_PERCENT = 80;
-
-function parseDate(value: Date | string | null | undefined): Date | null {
-  if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function formatDurationFromMs(ms: number): string {
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
-  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
-  const hours = ms / 3_600_000;
-  if (hours < 48) return `${hours.toFixed(1)}h`;
-  return `${(hours / 24).toFixed(1)}d`;
-}
-
-function countStuckRuns(runs: HeartbeatRun[], thresholdMinutes: number): number {
-  const now = Date.now();
-  const thresholdMs = thresholdMinutes * 60_000;
-  return runs.filter((run) => {
-    if (run.status !== "running") return false;
-    const startedAt = parseDate(run.startedAt);
-    if (!startedAt) return false;
-    return now - startedAt.getTime() >= thresholdMs;
-  }).length;
-}
-
-function meanCompletionMs(issues: Issue[], windowDays = 30): number | null {
-  const now = Date.now();
-  const windowStartMs = now - windowDays * 24 * 60 * 60 * 1000;
-  const durations = issues
-    .map((issue) => {
-      const startedAt = parseDate(issue.startedAt);
-      const completedAt = parseDate(issue.completedAt);
-      if (!startedAt || !completedAt) return null;
-      if (completedAt.getTime() < windowStartMs) return null;
-      const duration = completedAt.getTime() - startedAt.getTime();
-      return duration >= 0 ? duration : null;
-    })
-    .filter((value): value is number => value !== null);
-
-  if (durations.length === 0) return null;
-  const total = durations.reduce((acc, value) => acc + value, 0);
-  return total / durations.length;
-}
-
-function budgetAtRiskAgentCount(agents: Agent[], thresholdPercent: number): number {
-  return agents.filter((agent) => {
-    if (agent.budgetMonthlyCents <= 0) return false;
-    const utilization = (agent.spentMonthlyCents / agent.budgetMonthlyCents) * 100;
-    return utilization >= thresholdPercent && agent.status !== "terminated";
-  }).length;
-}
-
-function oldestApprovalAgeMs(approvals: Approval[]): number | null {
-  const now = Date.now();
-  const ages = approvals
-    .map((approval) => parseDate(approval.createdAt))
-    .filter((value): value is Date => value !== null)
-    .map((createdAt) => now - createdAt.getTime())
-    .filter((age) => age >= 0);
-
-  if (ages.length === 0) return null;
-  return Math.max(...ages);
-}
 
 function getRecentIssues(issues: Issue[]): Issue[] {
   return [...issues]
@@ -260,21 +205,11 @@ export function Dashboard() {
 
   const hasNoAgents = agents !== undefined && agents.length === 0;
   const stuckRunsCount = countStuckRuns(runs ?? [], STUCK_RUN_THRESHOLD_MINUTES);
-  const meanTaskCompletion = meanCompletionMs(issues ?? []);
+  const meanTaskCompletion = meanCompletionMs(issues ?? [], TASK_COMPLETION_WINDOW_DAYS);
   const budgetRiskAgents = budgetAtRiskAgentCount(agents ?? [], BUDGET_RISK_THRESHOLD_PERCENT);
   const approvalQueueAgeMs = oldestApprovalAgeMs(pendingApprovals ?? []);
-  const recentlyCompleted = (issues ?? [])
-    .filter((issue) => parseDate(issue.completedAt))
-    .sort((a, b) => {
-      const bTime = parseDate(b.completedAt)?.getTime() ?? 0;
-      const aTime = parseDate(a.completedAt)?.getTime() ?? 0;
-      return bTime - aTime;
-    });
-  const completedLast7Days = recentlyCompleted.filter((issue) => {
-    const completedAt = parseDate(issue.completedAt);
-    if (!completedAt) return false;
-    return Date.now() - completedAt.getTime() <= 7 * 24 * 60 * 60 * 1000;
-  }).length;
+  const recentlyCompleted = getRecentlyCompletedIssues(issues ?? []);
+  const completedLast7Days = countCompletedWithinWindow(recentlyCompleted);
 
   return (
     <div className="space-y-6">
@@ -397,7 +332,7 @@ export function Dashboard() {
                 to="/issues"
                 description={
                   <span>
-                    Average from start to done over last 30 days
+                    Average from start to done over last {TASK_COMPLETION_WINDOW_DAYS} days
                   </span>
                 }
               />
